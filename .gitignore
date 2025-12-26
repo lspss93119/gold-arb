@@ -196,3 +196,7 @@ cython_debug/
 
 # pyenv settings
 .python-version
+
+# Custom additions
+market_data_*.csv
+*.png
