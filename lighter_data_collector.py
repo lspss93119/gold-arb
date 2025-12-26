@@ -23,7 +23,8 @@ logging.basicConfig(
     handlers=[
         logging.FileHandler("data_collector.log"),
         logging.StreamHandler()
-    ]
+    ],
+    force=True
 )
 logger = logging.getLogger("DataCollector")
 
