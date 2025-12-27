@@ -42,6 +42,10 @@ class LighterDataCollector:
         self.csv_file_handle = None
         self.csv_writer = None
 
+        # Market Status State
+        self.last_xau_price = None
+        self.last_xau_update_time = time.time()
+
     async def setup_clients(self):
         """Setup and connect clients."""
         logger.info("Connecting to Lighter...")
@@ -101,6 +105,48 @@ class LighterDataCollector:
         if not depth_list: return None
         return depth_list[0]['p']
 
+    def check_market_status(self, current_xau_price):
+        """
+        Check if market is effectively open.
+        Returns: True (Open), False (Closed/Stagnant)
+        """
+        # 1. Update Stagnation Tracker
+        if current_xau_price is not None:
+            if self.last_xau_price is None or abs(current_xau_price - self.last_xau_price) > 1e-6:
+                self.last_xau_price = current_xau_price
+                self.last_xau_update_time = time.time()
+        
+        # Check Stagnation (> 10 mins = 600s)
+        time_since_update = time.time() - self.last_xau_update_time
+        if time_since_update > 600:
+            return False # Stagnant
+            
+        # 2. Check Schedule (UTC)
+        now_utc = datetime.utcnow()
+        weekday = now_utc.weekday() # Mon=0, Sun=6
+        hour = now_utc.hour
+        
+        # Close: Friday 22:00 UTC to Sunday 23:00 UTC
+        # Saturday (5) -> Closed
+        if weekday == 5:
+            return False
+            
+        # Friday (4) >= 22:00 -> Closed
+        if weekday == 4 and hour >= 22:
+            return False
+            
+        # Sunday (6) < 23:00 -> Closed
+        if weekday == 6 and hour < 23:
+            return False
+            
+        # 3. Check Holidays (Dec 25, Jan 1)
+        month = now_utc.month
+        day = now_utc.day
+        if (month == 12 and day == 25) or (month == 1 and day == 1):
+            return False
+            
+        return True
+
     def update_csv_file(self):
         """Rotate CSV file based on current hour."""
         now = datetime.now()
@@ -123,7 +169,8 @@ class LighterDataCollector:
                 'xau_best_bid', 'xau_best_ask', 
                 'paxg_spread', 'xau_spread',
                 'paxg_bids_depth', 'paxg_asks_depth',
-                'xau_bids_depth', 'xau_asks_depth'
+                'xau_bids_depth', 'xau_asks_depth',
+                'is_market_open'
             ]
             self.csv_writer = csv.DictWriter(self.csv_file_handle, fieldnames=fieldnames)
             
@@ -161,11 +208,15 @@ class LighterDataCollector:
                     xau_bb = self.get_best_price(xau_bids)
                     xau_ba = self.get_best_price(xau_asks)
                     
+                    # 3. Check Market Status
+                    # Use Bid as price reference (if avail)
+                    is_open = self.check_market_status(xau_bb)
+                    
                     # Spreads (Bid-Ask Spread within the market)
                     paxg_spread_val = (paxg_ba - paxg_bb) if (paxg_bb and paxg_ba) else None
                     xau_spread_val = (xau_ba - xau_bb) if (xau_bb and xau_ba) else None
                     
-                    # 3. Write Data
+                    # 4. Write Data
                     row = {
                         'timestamp': ts,
                         'readable_time': readable,
@@ -178,14 +229,15 @@ class LighterDataCollector:
                         'paxg_bids_depth': json.dumps(paxg_bids),
                         'paxg_asks_depth': json.dumps(paxg_asks),
                         'xau_bids_depth': json.dumps(xau_bids),
-                        'xau_asks_depth': json.dumps(xau_asks)
+                        'xau_asks_depth': json.dumps(xau_asks),
+                        'is_market_open': is_open
                     }
                     
                     if self.csv_writer:
                         self.csv_writer.writerow(row)
                         self.csv_file_handle.flush()
                         
-                    # 4. Wait for next second
+                    # 5. Wait for next second
                     elapsed = time.time() - start_time
                     delay = max(0, 1.0 - elapsed)
                     if delay > 0:

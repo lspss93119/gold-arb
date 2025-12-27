@@ -35,8 +35,25 @@ def load_data(pattern="market_data_*.csv"):
     if not df_list: return None
     
     full_df = pd.concat(df_list, ignore_index=True)
+    # Sort by timestamp
     full_df = full_df.sort_values('timestamp').reset_index(drop=True)
     
+    # Filter Invalid Data (Market Closed / Stagnant)
+    if 'is_market_open' in full_df.columns:
+        initial_count = len(full_df)
+        # Convert string 'True'/'False' to boolean if necessary (read_csv might load as string sometimes? usually smart enough)
+        # But to be safe against CSV string logic:
+        # If it was saved as boolean in Python, CSV might have "True"/"False" strings.
+        # Let's handle both.
+        full_df['is_market_open'] = full_df['is_market_open'].astype(str).map({'True': True, 'False': False, '1': True, '0': False, '1.0': True, '0.0': False})
+        
+        # Filter: Keep only Open rows
+        full_df = full_df[full_df['is_market_open'] == True]
+        filtered_count = len(full_df)
+        print(f"Filtered out {initial_count - filtered_count} rows where Market was Closed.")
+        
+        full_df = full_df.reset_index(drop=True)
+
     # Pre-calculate Mid Prices for Z-Score
     # Mid = (Bid + Ask) / 2
     full_df['paxg_mid'] = (full_df['paxg_best_bid'] + full_df['paxg_best_ask']) / 2
@@ -45,7 +62,7 @@ def load_data(pattern="market_data_*.csv"):
     # Spread = PAXG - XAU
     full_df['spread_diff'] = full_df['paxg_mid'] - full_df['xau_mid']
     
-    print(f"Loaded {len(full_df)} rows.")
+    print(f"Loaded {len(full_df)} valid rows.")
     return full_df
 
 def calculate_slippage_cost(row, amount_usdc, side):
