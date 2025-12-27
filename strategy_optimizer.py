@@ -9,14 +9,14 @@ from itertools import product
 from decimal import Decimal
 
 # Optimization Parameters
-WINDOW_MIN = 1800  # 30 mins
+WINDOW_MIN = 1800  # 0.5 hours
 WINDOW_MAX = 86400 # 24 hours
 WINDOW_STEP = 1800
 Z_MIN = 0.5
 Z_MAX = 3.0
 Z_STEP = 0.1
 
-def load_data(pattern="market_data_*.csv"):
+def load_data(pattern="data/market_data_*.csv"):
     """Load and merge all market data CSVs."""
     files = glob.glob(pattern)
     if not files:
@@ -39,23 +39,44 @@ def load_data(pattern="market_data_*.csv"):
     full_df = full_df.sort_values('timestamp').reset_index(drop=True)
     
     # Filter Invalid Data (Market Closed / Stagnant)
+    # 1. Flag-based filter (primary)
     if 'is_market_open' in full_df.columns:
-        initial_count = len(full_df)
-        # Convert string 'True'/'False' to boolean if necessary (read_csv might load as string sometimes? usually smart enough)
-        # But to be safe against CSV string logic:
-        # If it was saved as boolean in Python, CSV might have "True"/"False" strings.
-        # Let's handle both.
-        full_df['is_market_open'] = full_df['is_market_open'].astype(str).map({'True': True, 'False': False, '1': True, '0': False, '1.0': True, '0.0': False})
+        # Fill missing values (for old CSVs) with True (assume open, let Timestamp filter handle it)
+        full_df['is_market_open'] = full_df['is_market_open'].fillna(True)
+        # Handle string booleans and possible 'nan' strings
+        full_df['is_market_open'] = full_df['is_market_open'].astype(str).map({'True': True, 'False': False, '1': True, '0': False, '1.0': True, '0.0': False, 'nan': True})
         
         # Filter: Keep only Open rows
         full_df = full_df[full_df['is_market_open'] == True]
-        filtered_count = len(full_df)
-        print(f"Filtered out {initial_count - filtered_count} rows where Market was Closed.")
-        
-        full_df = full_df.reset_index(drop=True)
+    
+    # 2. Timestamp-based filter (secondary, enforces rules on old data)
+    # Market Open: Sun 23:00 UTC to Fri 22:00 UTC
+    # Filter out: Fri 22:00 <= Time < Sun 23:00
+    
+    # Convert to UTC datetime
+    full_df['dt_utc'] = pd.to_datetime(full_df['timestamp'], unit='s', utc=True)
+    
+    # Logic: Keep if NOT (Fri >= 22 or Sat or Sun < 23)
+    # Weekday: Mon=0 ... Fri=4, Sat=5, Sun=6
+    
+    condition_fri_closed = (full_df['dt_utc'].dt.weekday == 4) & (full_df['dt_utc'].dt.hour >= 22)
+    condition_sat_closed = (full_df['dt_utc'].dt.weekday == 5)
+    condition_sun_closed = (full_df['dt_utc'].dt.weekday == 6) & (full_df['dt_utc'].dt.hour < 23)
+    
+    # Filter Holidays (Dec 25, Jan 1)
+    condition_holiday = (
+        ((full_df['dt_utc'].dt.month == 12) & (full_df['dt_utc'].dt.day == 25)) |
+        ((full_df['dt_utc'].dt.month == 1) & (full_df['dt_utc'].dt.day == 1))
+    )
+    
+    full_df = full_df[
+        ~(condition_fri_closed | condition_sat_closed | condition_sun_closed | condition_holiday)
+    ]
+    
+    full_df = full_df.reset_index(drop=True)
+    full_df = full_df.drop(columns=['dt_utc']) # Clean up
 
     # Pre-calculate Mid Prices for Z-Score
-    # Mid = (Bid + Ask) / 2
     full_df['paxg_mid'] = (full_df['paxg_best_bid'] + full_df['paxg_best_ask']) / 2
     full_df['xau_mid'] = (full_df['xau_best_bid'] + full_df['xau_best_ask']) / 2
     
@@ -70,21 +91,15 @@ def calculate_slippage_cost(row, amount_usdc, side):
     Calculate slippage cost based on orderbook depth.
     amount_usdc: Trade size in USDC
     side: 'buy_spread' (Buy PAXG, Sell XAU) or 'sell_spread' (Sell PAXG, Buy XAU)
-    
-    Returns: Cost in Spread Points (or USDC? Strategy uses Spread Points for PnL usually, but let's stick to USDC cost).
-    Actually, simpler: Calculate Average Execution Price for both legs and compare to Mid Price.
-    Cost = |Exec - Mid| * Size.
     """
     try:
-        # Parse JSON depth
-        # PAXG
-        paxg_depth_key = 'paxg_asks_depth' if side == 'buy_spread' else 'paxg_bids_depth' # Buy PAXG if buying spread
-        xau_depth_key = 'xau_bids_depth' if side == 'buy_spread' else 'xau_asks_depth'    # Sell XAU if buying spread
+        # PAXG Depth Key
+        paxg_depth_key = 'paxg_asks_depth' if side == 'buy_spread' else 'paxg_bids_depth' 
+        xau_depth_key = 'xau_bids_depth' if side == 'buy_spread' else 'xau_asks_depth'    
         
-        # Reverse logic for Sell Spread
         if side == 'sell_spread':
-            paxg_depth_key = 'paxg_bids_depth' # Sell PAXG
-            xau_depth_key = 'xau_asks_depth'   # Buy XAU
+            paxg_depth_key = 'paxg_bids_depth' 
+            xau_depth_key = 'xau_asks_depth'   
             
         paxg_depth = json.loads(row[paxg_depth_key])
         xau_depth = json.loads(row[xau_depth_key])
@@ -98,7 +113,6 @@ def calculate_slippage_cost(row, amount_usdc, side):
                 p = float(level['p'])
                 s = float(level['s'])
                 
-                # Check value capacity of this level
                 level_val = p * s
                 remaining_val = target_value - filled_val
                 
@@ -115,25 +129,18 @@ def calculate_slippage_cost(row, amount_usdc, side):
             if filled_val == 0: return None
             return weighted_sum / total_qty if total_qty > 0 else None
 
-        # Price Impact
         paxg_avg = get_avg_price(paxg_depth, amount_usdc)
         xau_avg = get_avg_price(xau_depth, amount_usdc)
         
         if paxg_avg is None or xau_avg is None:
-            return float('inf') # Infinite cost if no liquidity
+            return float('inf') 
             
-        # Cost relative to Mid Price used in Z-Score
-        # Spread PnL is based on Mid. Trade is based on Exec.
-        # Slippage = |Exec - Mid|
         paxg_mid = (row['paxg_best_bid'] + row['paxg_best_ask']) / 2
         xau_mid = (row['xau_best_bid'] + row['xau_best_ask']) / 2
         
         slip_paxg = abs(paxg_avg - paxg_mid)
         slip_xau = abs(xau_avg - xau_mid)
         
-        # Total Slippage per unit? Or total value?
-        # Let's return Total Slippage Cost in USDC for this trade size
-        # Approx qty = amount_usdc / price
         qty_paxg = amount_usdc / paxg_mid
         qty_xau = amount_usdc / xau_mid
         
@@ -141,24 +148,19 @@ def calculate_slippage_cost(row, amount_usdc, side):
         return total_cost
 
     except Exception:
-        return 0.0 # Fallback
+        return 0.0 
 
 def backtest(df, window_seconds, z_entry, trade_size_usdc=1000):
     """
-    Vectorized backtest is hard with sliding window + state. 
-    Use Iteration with pre-calc rolling stats.
+    Backtest strategy for specific parameters.
     """
-    # 1. Calc Rolling Stats
-    # Window in rows? We assume 1s frequency roughly.
-    # If gaps exist, rolling('Xs') is better but requires index time.
-    
     df_test = df.copy()
-    df_test.set_index(pd.to_datetime(df_test['readable_time']), inplace=True)
+    # Simple rolling mean/std calculation
+    rolling = df_test['spread_diff'].rolling(window=int(window_seconds), min_periods=max(1, int(window_seconds/2)))
     
-    indexer = pd.api.indexers.FixedForwardWindowIndexer(window_size=window_seconds) # Wait, we need looking BACK.
-    # rolling(str) is backward looking.
-    
-    rolling = df_test['spread_diff'].rolling(window=f'{window_seconds}s', min_periods=int(window_seconds/2))
+    # Note: Rolling on integer window assumes continuous data. 
+    # Since we filter weekends, there might be jumps. 
+    # Ideally should use time-based rolling, but integer is faster for estimation.
     
     df_test['mean'] = rolling.mean()
     df_test['std'] = rolling.std()
@@ -166,72 +168,40 @@ def backtest(df, window_seconds, z_entry, trade_size_usdc=1000):
     # Z-Score
     df_test['z_score'] = (df_test['spread_diff'] - df_test['mean']) / df_test['std']
     
-    # Simulation
-    position = 0 # 0, 1 (Long Spread), -1 (Short Spread)
+    df_test = df_test.dropna(subset=['z_score'])
+    
+    position = 0 
     pnl = 0.0
     entry_price = 0.0
     max_pnl = 0.0
     dd = 0.0
     
-    # We iterate nicely
-    # Note: Vectorization is faster but logic is complex.
-    # For optimization, we need speed.
-    
-    # Let's clean NA
-    df_test = df_test.dropna(subset=['z_score'])
-    
-    # Extract arrays for speed
-    z_vals = df_test['z_score'].values
-    spread_vals = df_test['spread_diff'].values
-    # timestamps = df_test['timestamp'].values # For duration
-    # depths... we need raw rows for slippage.
-    # Accessing dataframe inside loop is slow.
-    # Pre-calc slippage? Slippage depends on side. 
-    # Approx: Slippage is constant % or func of volatility? 
-    # For accurate "Real Slippage", we must look up depth.
-    # To optimize speed: Assume average slippage or look up only on trade.
-    
     records = df_test.to_dict('records')
     
-    trade_log = []
-    
-    for row, z, spread in zip(records, z_vals, spread_vals):
-        # Entry/Exit Logic
-        # Exit Z is usually mean reversion (0) or small buffer. Fixed at 0.0 or 0.2?
-        # Prompt only asks to optimize Z-Score (Entry). Exit logic implicit?
-        # Usually Exit at 0 or Z_Entry * 0.2. Let's assume Exit at 0 for simplicity or fixed parameter.
-        # User defined Z Range 0.5 to 3.0. This is Entry.
-        # Exit implicitly 0 or symmetrical?
-        # I'll assume Exit at Z=0 for Sharpe maximization.
-        
-        # Slippage Cost (One-time on Entry + One-time on Exit)
+    for row in records:
+        z = row['z_score']
+        spread = row['spread_diff']
         
         if position == 0:
             if z > z_entry:
-                # Open Short Spread (Sell PAXG, Buy XAU)
+                # Open Short Spread
                 cost = calculate_slippage_cost(row, trade_size_usdc, 'sell_spread')
                 position = -1
                 entry_price = spread
                 pnl -= cost 
                 
             elif z < -z_entry:
-                # Open Long Spread (Buy PAXG, Sell XAU)
+                # Open Long Spread
                 cost = calculate_slippage_cost(row, trade_size_usdc, 'buy_spread')
                 position = 1
                 entry_price = spread
                 pnl -= cost 
                 
         elif position == -1:
-            if z <= 0: # Mean Reversion
+            if z <= 0: 
                 # Close Short
-                cost = calculate_slippage_cost(row, trade_size_usdc, 'buy_spread') # Inverse action
-                gross_profit = (entry_price - spread) * (trade_size_usdc / 2000) # Approx Notional Scaling? 
-                # Spread is diff in Price. PnL ~ Spread_Diff * Quantity.
-                # Quantity ~ trade_size / Price. ~ 1000 / 2700 ~ 0.37 unit.
-                # Exact PnL = (Entry_Spread - Curr_Spread) * Qty
-                # We approximate Qty = trade_size_usdc / MidPrice(approx 2700)
+                cost = calculate_slippage_cost(row, trade_size_usdc, 'buy_spread')
                 qty = trade_size_usdc / 2700.0 
-                
                 profit = (entry_price - spread) * qty 
                 pnl += (profit - cost)
                 position = 0
@@ -245,7 +215,6 @@ def backtest(df, window_seconds, z_entry, trade_size_usdc=1000):
                 pnl += (profit - cost)
                 position = 0
                 
-        # Track Max DD
         if pnl > max_pnl: max_pnl = pnl
         if (pnl - max_pnl) < dd: dd = (pnl - max_pnl)
         
@@ -265,10 +234,8 @@ def optimize():
     for w, z in product(windows, z_scores):
         pnl, dd = backtest(df, w, z)
         
-        # Calc Sharpe (Approx based on single result? Need annualized vol of returns?
-        # Simple Sharpe = PnL / |MaxDD| if valid? 
-        # Or just Return / Risk
         sharpe = pnl / abs(dd) if dd != 0 else 0
+        if pnl == 0: sharpe = 0
         
         results.append({
             'window': w,
@@ -277,9 +244,8 @@ def optimize():
             'max_dd': dd,
             'sharpe': sharpe
         })
-        print(f"W: {w}, Z: {z:.1f} -> PnL: {pnl:.2f}, Sharpe: {sharpe:.2f}")
+        # print(f"W: {w}, Z: {z:.1f} -> PnL: {pnl:.2f}, Sharpe: {sharpe:.2f}")
         
-    # Convert to DF
     res_df = pd.DataFrame(results)
     
     # 1. Heatmap
@@ -289,17 +255,52 @@ def optimize():
     plt.title("Sharpe Ratio Heatmap")
     plt.xlabel("Z-Score Threshold")
     plt.ylabel("Window Size (sec)")
-    plt.savefig("optimizer_heatmap.png")
-    print("Saved heatmap to optimizer_heatmap.png")
+    plt.savefig("data/optimizer_heatmap.png")
+    print("\nSaved heatmap to data/optimizer_heatmap.png")
     
-    # 2. Recommendations
-    best = res_df.sort_values('sharpe', ascending=False).iloc[0]
+    # 2. Find Parameter Plateau (Robustness)
+    # We look for the cell with the highest average Sharpe among its neighbors (3x3 grid)
+    print("\nCalculating Robust Plateau...")
+    
+    best_plateau_score = -999
+    best_config = None
+    
+    # Helper to clean grid values
+    grid_values = pivot.fillna(0).values 
+    rows = pivot.index
+    cols = pivot.columns
+    
+    for r in range(1, len(rows)-1):
+        for c in range(1, len(cols)-1):
+            # 3x3 kernel
+            kernel = grid_values[r-1:r+2, c-1:c+2]
+            avg_score = np.mean(kernel)
+            
+            if avg_score > best_plateau_score:
+                best_plateau_score = avg_score
+                best_config = (rows[r], cols[c])
+                
+    # Fallback to absolute max if no plateau found (e.g. grid too small)
+    best_single = res_df.sort_values('sharpe', ascending=False).iloc[0]
+    
     print("\n=== OPTIMIZATION RESULT ===")
-    print(f"Best Window: {int(best['window'])}s ({best['window']/3600:.1f}h)")
-    print(f"Best Z-Score: {best['z_score']:.1f}")
-    print(f"Net Profit: ${best['pnl']:.2f}")
-    print(f"Sharpe Ratio: {best['sharpe']:.4f}")
-    print(f"Max Drawdown: ${best['max_dd']:.2f}")
     
+    if best_config:
+        w_p, z_p = best_config
+        # Fetch detailed stats for the center of the plateau
+        plateau_stats = res_df[(res_df['window'] == w_p) & (np.isclose(res_df['z_score'], z_p))].iloc[0]
+        
+        print(f"--- Recommended Robust Parameters (Plateau) ---")
+        print(f"Window Size : {int(w_p)}s ({w_p/3600:.1f}h)")
+        print(f"Z-Score     : {z_p:.1f}")
+        print(f"Avg Sharpe (Neighbors): {best_plateau_score:.4f}")
+        print(f"Net Profit  : ${plateau_stats['pnl']:.2f}")
+    else:
+        print("No robust plateau found (grid too small or flat). Using single best.")
+        
+    print(f"\n--- Absolute Best Single Run ---")
+    print(f"Window: {int(best_single['window'])}s, Z: {best_single['z_score']:.1f}")
+    print(f"Profit: ${best_single['pnl']:.2f}, Sharpe: {best_single['sharpe']:.4f}")
+
 if __name__ == "__main__":
     optimize()

@@ -104,9 +104,8 @@ class LighterClient(BaseExchangeClient):
             try:
                 self.lighter_client = SignerClient(
                     url=self.base_url,
-                    private_key=self.api_key_private_key,
                     account_index=self.account_index,
-                    api_key_index=self.api_key_index,
+                    api_private_keys={self.api_key_index: self.api_key_private_key},
                 )
 
                 # Check client

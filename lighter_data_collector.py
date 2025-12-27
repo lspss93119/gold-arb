@@ -22,7 +22,7 @@ logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler("data_collector.log"),
+        logging.FileHandler("logs/data_collector.log"),
         logging.StreamHandler()
     ],
     force=True
@@ -154,7 +154,7 @@ class LighterDataCollector:
             retention_hours = 48
             cutoff_time = time.time() - (retention_hours * 3600)
             
-            files = glob.glob("market_data_*.csv")
+            files = glob.glob("data/market_data_*.csv")
             for f in files:
                 try:
                     # simplistic check: modification time
@@ -170,7 +170,7 @@ class LighterDataCollector:
     def update_csv_file(self):
         """Rotate CSV file based on current hour."""
         now = datetime.now()
-        filename = f"market_data_{now.strftime('%Y%m%d_%H')}.csv"
+        filename = f"data/market_data_{now.strftime('%Y%m%d_%H')}.csv"
         
         if filename != self.current_csv_file:
             # Trigger cleanup on rotation
