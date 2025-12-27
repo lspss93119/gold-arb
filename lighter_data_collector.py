@@ -1,6 +1,7 @@
 
 import asyncio
 import os
+import glob
 import csv
 import json
 import time
@@ -147,12 +148,34 @@ class LighterDataCollector:
             
         return True
 
+    def cleanup_old_files(self):
+        """Delete CSV files older than 48 hours to save disk space."""
+        try:
+            retention_hours = 48
+            cutoff_time = time.time() - (retention_hours * 3600)
+            
+            files = glob.glob("market_data_*.csv")
+            for f in files:
+                try:
+                    # simplistic check: modification time
+                    mtime = os.path.getmtime(f)
+                    if mtime < cutoff_time:
+                        os.remove(f)
+                        logger.info(f"Cleanup: Deleted old file {f}")
+                except Exception as e:
+                    logger.warning(f"Cleanup Error on {f}: {e}")
+        except Exception as e:
+            logger.error(f"Cleanup Failed: {e}")
+
     def update_csv_file(self):
         """Rotate CSV file based on current hour."""
         now = datetime.now()
         filename = f"market_data_{now.strftime('%Y%m%d_%H')}.csv"
         
         if filename != self.current_csv_file:
+            # Trigger cleanup on rotation
+            self.cleanup_old_files()
+            
             # Close old
             if self.csv_file_handle:
                 self.csv_file_handle.close()
